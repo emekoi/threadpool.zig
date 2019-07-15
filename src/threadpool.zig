@@ -11,7 +11,7 @@ const deque = @import("deque");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
-pub const TaskFn = fn (data: var) anyerror!void;
+pub const TaskFn = fn () anyerror!void;
 
 pub fn Future(comptime T: type) type {
     return union(enum) {
@@ -41,14 +41,13 @@ pub const ThreadPool = struct {
     const Stealer = deque.Stealer(Task, 32);
 
     const Task = struct {
-        task_fn: ?TaskFn = null,
-        // future: Future(void),
+        task_fn: TaskFn,
     };
 
     const Worker = struct {
         stealer: Stealer,
         terminate: bool,
-        thread: *Thread,
+        thread: ?*Thread,
 
         fn run(self: *Worker) u8 {
             while (!self.terminate) {
@@ -68,12 +67,13 @@ pub const ThreadPool = struct {
         fn shutdown(self: *Worker) void {
             // this race condition is okay (i think)
             self.terminate = true;
-            self.thread.wait();
+            if (self.thread) |thread|
+                thread.wait();
         }
     };
 
     allocator: *Allocator,
-    worker_pool: []*Thread,
+    worker_pool: []Worker,
     thread_count: usize,
     work_pool: Deque,
 
@@ -83,15 +83,19 @@ pub const ThreadPool = struct {
         }
 
         const count = thread_count orelse try Thread.cpuCount();
-        return ThreadPool{
+        var result = ThreadPool{
             .allocator = allocator,
             .worker_pool = try allocator.alloc(Worker, count),
             .thread_count = count,
-            .work_pool = try TaskDeque.new(allocator),
+            .work_pool = try Deque.new(allocator),
         };
+        for (result.worker_pool) |*worker| {
+            worker.thread = null;
+        }
+        return result;
     }
 
-    pub fn deinit(self: *ThreadPool) !void {
+    pub fn deinit(self: *ThreadPool) void {
         for (self.worker_pool) |*worker| {
             worker.shutdown();
         }
@@ -107,7 +111,9 @@ pub const ThreadPool = struct {
     }
 
     pub fn push(self: *ThreadPool, task: TaskFn) !void {
-        try self.work_pool.push(Task{ .task_fn = task });
+        try self.work_pool.push(Task{
+            .task_fn = task,
+        });
     }
 };
 
@@ -117,5 +123,38 @@ test "simple" {
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var allocator = &fba.allocator;
 
+    const Test = struct {
+        var static: usize = 0;
+
+        fn hello() anyerror!void {
+            try std.io.null_out_stream.print("hello {}: {}\n", Thread.getCurrentId(), static);
+            static += 1;
+        }
+    };
+
     var pool = try ThreadPool.init(allocator, null);
+    defer pool.deinit();
+    const AMOUNT = 1000000;
+    {
+        var i: usize = AMOUNT;
+        while (i > 0) : (i -= 1) {
+            try pool.push(Test.hello);
+        }
+
+        var timer = try std.time.Timer.start();
+        try pool.start();
+        std.debug.warn("\n time-multi: {}\n", timer.lap());
+        timer.reset();
+        Test.static = 0;
+    }
+
+    {
+        var timer = try std.time.Timer.start();
+
+        var i: usize = AMOUNT;
+        while (i > 0) : (i -= 1) {
+            try Test.hello();
+        }
+        std.debug.warn("time-single: {}\n", timer.lap());
+    }
 }
