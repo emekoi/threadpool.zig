@@ -1,4 +1,4 @@
-//  Copyright (c) 2018 emekoi
+//  Copyright (c) 2020 emekoi
 //
 //  This library is free software; you can redistribute it and/or modify it
 //  under the terms of the MIT license. See LICENSE for details.
@@ -53,7 +53,7 @@ pub const ThreadPool = struct {
             while (!self.terminate) {
                 while (self.stealer.steal()) |task| {
                     task.task_fn() catch |err| {
-                        std.debug.warn("error: {}\n", @errorName(err));
+                        std.debug.warn("error: {}\n", .{@errorName(err)});
                         if (@errorReturnTrace()) |trace| {
                             std.debug.dumpStackTrace(trace.*);
                         }
@@ -118,8 +118,8 @@ pub const ThreadPool = struct {
 };
 
 test "simple" {
-    var slice = try std.heap.direct_allocator.alloc(u8, 1 << 24);
-    defer std.heap.direct_allocator.free(slice);
+    var slice = try std.heap.page_allocator.alloc(u8, 1 << 24);
+    defer std.heap.page_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var allocator = &fba.allocator;
 
@@ -127,7 +127,7 @@ test "simple" {
         var static: usize = 0;
 
         fn hello() anyerror!void {
-            try std.io.null_out_stream.print("hello {}: {}\n", Thread.getCurrentId(), static);
+            try std.io.null_out_stream.print("hello {}: {}\n", .{Thread.getCurrentId(), static});
             static += 1;
         }
     };
@@ -143,7 +143,7 @@ test "simple" {
 
         var timer = try std.time.Timer.start();
         try pool.start();
-        std.debug.warn("\n time-multi: {}\n", timer.lap());
+        std.debug.warn("\n time-multi: {}\n", .{timer.lap()});
         timer.reset();
         Test.static = 0;
     }
@@ -155,6 +155,6 @@ test "simple" {
         while (i > 0) : (i -= 1) {
             try Test.hello();
         }
-        std.debug.warn("time-single: {}\n", timer.lap());
+        std.debug.warn("time-single: {}\n", .{timer.lap()});
     }
 }

@@ -5,6 +5,7 @@ pub fn build(b: *Builder) void {
     const lib = b.addStaticLibrary("threadpool", "src/index.zig");
     lib.addPackagePath("deque", "deque.zig/src/deque.zig");
     lib.setBuildMode(mode);
+    lib.install();
 
     var main_tests = b.addTest("src/threadpool.zig");
     main_tests.addPackagePath("deque", "deque.zig/src/deque.zig");
@@ -12,7 +13,4 @@ pub fn build(b: *Builder) void {
 
     const test_step = b.step("test", "run library tests");
     test_step.dependOn(&main_tests.step);
-
-    b.default_step.dependOn(&lib.step);
-    b.installArtifact(lib);
 }
