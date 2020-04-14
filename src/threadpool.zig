@@ -8,117 +8,154 @@ const std = @import("std");
 const builtin = @import("builtin");
 const deque = @import("deque");
 
+const SegmentedList = std.SegmentedList;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 
-pub const TaskFn = fn () anyerror!void;
+pub fn Task(frame: *anyframe->anyerror!void, f: var, args: var) anyerror!void {
+    defer std.debug.warn("\nthread:{} -> exit", .{Thread.getCurrentId()});
+    suspend {
+        std.debug.warn("\nthread:{} -> 0x{x}", .{Thread.getCurrentId(), @ptrToInt(@frame())});
+        frame.* = @frame();
+    }
 
-pub fn Future(comptime T: type) type {
-    return union(enum) {
-        const Self = @This();
+    const Args = @TypeOf(args);
 
-        Error: anyerror,
-        Ok: T,
-
-        pub async fn resolve(self: Self) !T {
-            return switch (self) {
-                Self.Error => |err| err,
-                Self.Ok => |ok| ok,
-            };
+    comptime {
+        const info = @typeInfo(@TypeOf(f));
+        if (info.Fn.args.len > 0) {
+            std.debug.assert(info.Fn.args[0].arg_type.? == Args);
         }
+    }
 
-        pub async fn get(self: Self) !T {
-            return switch (self) {
-                Self.Error => |err| err,
-                Self.Ok => |ok| ok,
-            };
-        }
-    };
+    const args_ = if (@sizeOf(Args) == 0) .{} else args;
+
+    switch (@typeInfo(@TypeOf(f).ReturnType)) {
+        builtin.TypeId.Void => {
+            @call(.{}, f, args_);
+        },
+        builtin.TypeId.ErrorUnion => {
+            try @call(.{}, f, args_);
+        },
+        else => @compileError("expected return type of main to be 'void', or '!void'"),
+    }
 }
 
 pub const ThreadPool = struct {
-    const Deque = deque.Deque(Task, 32);
-    const Stealer = deque.Stealer(Task, 32);
-
-    const Task = struct {
-        task_fn: TaskFn,
-    };
-
-    const Worker = struct {
-        stealer: Stealer,
-        terminate: bool,
-        thread: ?*Thread,
-
-        fn run(self: *Worker) u8 {
-            while (!self.terminate) {
-                while (self.stealer.steal()) |task| {
-                    task.task_fn() catch |err| {
-                        std.debug.warn("error: {}\n", .{@errorName(err)});
-                        if (@errorReturnTrace()) |trace| {
-                            std.debug.dumpStackTrace(trace.*);
-                        }
-                        return 1;
-                    };
-                }
-            }
-            return 0;
-        }
-
-        fn shutdown(self: *Worker) void {
-            // this race condition is okay (i think)
-            self.terminate = true;
-            if (self.thread) |thread|
-                thread.wait();
-        }
-    };
+    const ThreadList = SegmentedList(WorkerThread, 8);
+    const Stealer = deque.Stealer(anyframe->anyerror!void, 32);
+    const Deque = deque.Deque(anyframe->anyerror!void, 32);
 
     allocator: *Allocator,
-    worker_pool: []Worker,
+    threads: ThreadList,
     thread_count: usize,
-    work_pool: Deque,
+    frame_pool: Deque,
+
+    const WorkerThread = struct {
+        terminate: bool = false,
+        thread: ?*Thread = null,
+        stealer: Stealer,
+
+        fn run(self: *WorkerThread) anyerror!void {
+            while (true) {
+                while (self.stealer.steal()) |frame| {
+                    try process(frame);
+                }
+                if (self.terminate) break;
+            }
+        }
+
+        fn process(frame: anyframe->anyerror!void) anyerror!void {
+            resume frame;
+        }
+    };
 
     pub fn init(allocator: *Allocator, thread_count: ?usize) !ThreadPool {
-        if (builtin.single_threaded) {
-            @compileError("cannot use ThreadPool in signgle threaded build mode");
-        }
-
-        const count = thread_count orelse try Thread.cpuCount();
-        var result = ThreadPool{
+        return ThreadPool {
             .allocator = allocator,
-            .worker_pool = try allocator.alloc(Worker, count),
-            .thread_count = count,
-            .work_pool = try Deque.new(allocator),
+            .threads = ThreadList.init(allocator),
+            .thread_count = thread_count orelse try Thread.cpuCount(),
+            .frame_pool = try Deque.new(allocator),
         };
-        for (result.worker_pool) |*worker| {
-            worker.thread = null;
-        }
-        return result;
     }
 
     pub fn deinit(self: *ThreadPool) void {
-        for (self.worker_pool) |*worker| {
-            worker.shutdown();
+        var iter = self.threads.iterator(0);
+        defer self.frame_pool.deinit();
+
+        while (iter.next()) |worker| {
+            if (worker.thread) |thread| {
+                worker.terminate = true;
+                thread.wait();
+            }
         }
     }
 
     pub fn start(self: *ThreadPool) !void {
-        for (self.worker_pool) |*worker| {
-            worker.terminate = false;
-            worker.stealer = self.work_pool.stealer();
-            @fence(.SeqCst);
-            worker.thread = try Thread.spawn(worker, Worker.run);
+        if (!builtin.single_threaded) {
+            var iter = self.threads.iterator(0);
+            var i: usize = 0;
+            while (i < self.thread_count) : (i += 1) {
+                var worker = try self.threads.addOne();
+                worker.stealer = self.frame_pool.stealer();
+                @fence(.SeqCst);
+                worker.thread = try Thread.spawn(worker, WorkerThread.run);
+            }
+        }
+    }
+    
+    pub fn sync(self: *ThreadPool) !void {
+        while (!self.frame_pool.isEmpty()) {
+            while (self.frame_pool.pop()) |frame| {
+                // try WorkerThread.process(@intToPtr(@TypeOf(frame), @ptrToInt(frame) - 0x10).*);
+                // try WorkerThread.process(frame);
+                // _ = await frame;
+                resume frame.*;
+                std.debug.warn("\nsync:{} -> 0x{x}", .{Thread.getCurrentId(), @ptrToInt(frame)});
+            }
         }
     }
 
-    pub fn push(self: *ThreadPool, task: TaskFn) !void {
-        try self.work_pool.push(Task{
-            .task_fn = task,
-        });
+    pub fn pushAsync(self: *ThreadPool, fun: var, args: var) anyerror!void {
+        
+    }
+
+    pub fn push(self: *ThreadPool, f: var, args: var) anyerror!void {
+        var frame = try self.frame_pool.addOne();
+        _ = async Task(frame, f, args);
+        // resume frame.*;
+        // frame.* = @as(anyframe->anyerror!void, async Task(f, args));
+        // resume f;
+        // try WorkerThread.process(self.frame_pool.pop().?);
+        // resume self.frame_pool.pop().?;
+        // try WorkerThread.process(frame.*);
+        // std.debug.warn("\nthread:{} -> 0x{x}", .{Thread.getCurrentId(), @ptrToInt(frame.*)});
+        // _ = noasync await frame;
     }
 };
 
-test "simple" {
-    var slice = try std.heap.page_allocator.alloc(u8, 1 << 24);
+// test "simple-single-threaded" {
+//     const AMOUNT = 1000000;
+//     const Test = struct {
+//         var static: usize = 0;
+
+//         fn hello() anyerror!void {
+//             try std.io.null_out_stream.print("hello {}: {}\n", .{Thread.getCurrentId(), static});
+//             static += 1;
+//         }
+//     };
+
+//     var timer = try std.time.Timer.start();
+
+//     var i: usize = AMOUNT;
+//     while (i > 0) : (i -= 1) {
+//         try Test.hello();
+//     }
+//     std.debug.warn(" time-single: {} ", .{timer.lap()});
+// }
+
+test "simple-multi-threaded" {
+    var slice = try std.heap.page_allocator.alloc(u8, 1 << 29);
     defer std.heap.page_allocator.free(slice);
     var fba = std.heap.ThreadSafeFixedBufferAllocator.init(slice);
     var allocator = &fba.allocator;
@@ -127,34 +164,32 @@ test "simple" {
         var static: usize = 0;
 
         fn hello() anyerror!void {
-            try std.io.null_out_stream.print("hello {}: {}\n", .{Thread.getCurrentId(), static});
+            // std.debug.warn("\nhello {}", .{static});
             static += 1;
+            // return error.TODO;
         }
     };
 
-    var pool = try ThreadPool.init(allocator, null);
+    var pool = try ThreadPool.init(allocator, 1);
     defer pool.deinit();
-    const AMOUNT = 1000000;
-    {
-        var i: usize = AMOUNT;
-        while (i > 0) : (i -= 1) {
-            try pool.push(Test.hello);
-        }
-
-        var timer = try std.time.Timer.start();
-        try pool.start();
-        std.debug.warn("\n time-multi: {}\n", .{timer.lap()});
-        timer.reset();
-        Test.static = 0;
+    
+    const AMOUNT = 10;
+    var i: usize = AMOUNT;
+    while (i > 0) : (i -= 1) {
+        try pool.push(Test.hello, {});
+        // var frame  = pool.frame_pool.pop().?;
+        // std.debug.warn("\n_sync -> 0x{x}", .{@ptrToInt(frame.*)});
+        // resume frame.*;
+        // try pool.sync();
     }
 
-    {
-        var timer = try std.time.Timer.start();
+    // resume pool.frame_pool.pop().?.*;
 
-        var i: usize = AMOUNT;
-        while (i > 0) : (i -= 1) {
-            try Test.hello();
-        }
-        std.debug.warn("time-single: {}\n", .{timer.lap()});
-    }
+    var timer = try std.time.Timer.start();
+    // try pool.start();
+    try pool.sync(); 
+
+    std.debug.warn("\ntime-multi: {} {} ", .{timer.lap(), Test.static});
+    timer.reset();
+    Test.static = 0;
 }
